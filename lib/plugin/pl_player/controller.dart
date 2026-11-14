@@ -27,6 +27,7 @@ import 'package:PiliPlus/plugin/pl_player/models/heart_beat_type.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_repeat.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
 import 'package:PiliPlus/plugin/pl_player/models/video_fit_type.dart';
+import 'package:PiliPlus/plugin/pl_player/player_diagnostics.dart';
 import 'package:PiliPlus/plugin/pl_player/utils/danmaku_options.dart';
 import 'package:PiliPlus/plugin/pl_player/utils/fullscreen.dart';
 import 'package:PiliPlus/services/service_locator.dart';
@@ -762,6 +763,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
       if (_playerCount == 0) {
         _removeListeners();
+        PlayerDiagnostics.instance.detach(_videoPlayerController);
         _videoPlayerController?.dispose();
         _videoPlayerController = null;
         _videoController = null;
@@ -847,6 +849,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     final opt = {
       'video-sync': Pref.videoSync,
       if (Platform.isAndroid) 'ao': Pref.audioOutput,
+      if (PlayerDiagnostics.enabled) ...PlayerDiagnostics.instance.mpvOptions,
     };
     final autosync = Pref.autosync;
     if (autosync != '0') {
@@ -859,6 +862,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         options: opt,
       ),
     );
+    PlayerDiagnostics.instance.attach(player);
 
     // >100% 的音量走 af 增益+限幅，避免直接放大 mpv volume 导致削波
     await setVolumeCapped(
@@ -909,6 +913,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       player = await _initPlayer();
       if (_playerCount == 0) {
         _removeListeners();
+        PlayerDiagnostics.instance.detach(player);
         player.dispose();
         player = null;
         _videoController = null;
@@ -1696,6 +1701,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     if (kDebugMode) {
       debugPrint('dispose player');
     }
+    PlayerDiagnostics.instance.detach(_videoPlayerController);
     _videoPlayerController?.dispose();
     _videoPlayerController = null;
     _videoController = null;

@@ -36,6 +36,8 @@ import 'package:PiliPlus/pages/video/widgets/header_mixin.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_repeat.dart';
+import 'package:PiliPlus/plugin/pl_player/player_diagnostics.dart';
+import 'package:PiliPlus/plugin/pl_player/widgets/player_diagnostics_panel.dart';
 import 'package:PiliPlus/services/shutdown_timer_service.dart'
     show shutdownTimerService, ShutdownPanel;
 import 'package:PiliPlus/utils/accounts.dart';
@@ -45,6 +47,7 @@ import 'package:PiliPlus/utils/extension/num_ext.dart';
 import 'package:PiliPlus/utils/image_utils.dart';
 import 'package:PiliPlus/utils/ios/pip_helper.dart';
 import 'package:PiliPlus/utils/page_utils.dart';
+import 'package:PiliPlus/utils/path_utils.dart';
 import 'package:PiliPlus/utils/platform_utils.dart';
 import 'package:PiliPlus/utils/storage.dart';
 import 'package:PiliPlus/utils/storage_key.dart';
@@ -851,12 +854,37 @@ class HeaderControlState extends State<HeaderControl>
                       subtitle: Text(hwdec),
                       onTap: () => Utils.copyText('hwdec\n$hwdec'),
                     ),
+                    if (PlayerDiagnostics.enabled) ...[
+                      const Divider(height: 8),
+                      Padding(
+                        padding: const .symmetric(horizontal: 24, vertical: 4),
+                        child: Text(
+                          '渲染诊断',
+                          style: TextStyle(
+                            fontSize: 13,
+                            color: colorScheme.primary,
+                          ),
+                        ),
+                      ),
+                      PlayerDiagnosticsPanel(player: player),
+                    ],
                   ],
                 ),
               ),
             ),
           ),
           actions: [
+            if (PlayerDiagnostics.enabled)
+              TextButton(
+                onPressed: () =>
+                    Utils.copyText(PlayerDiagnostics.instance.report(player)),
+                child: const Text('复制诊断'),
+              ),
+            if (PlayerDiagnostics.enabled)
+              TextButton(
+                onPressed: () => PathUtils.openDir(appSupportDirPath),
+                child: const Text('日志目录'),
+              ),
             TextButton(
               onPressed: Get.back,
               child: Text(

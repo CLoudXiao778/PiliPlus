@@ -49,7 +49,18 @@ jobs:
         run: |
           git clone --depth=1 -b native https://github.com/bggRGjQaUbCoE/media-kit.git media-kit
           git -C media-kit apply "$env:GITHUB_WORKSPACE/patches/media_kit_video_windows_render.patch"
-          python -c "import re; p='pubspec.yaml'; s=open(p,encoding='utf-8').read(); s=re.sub(r'(?ms)^  media_kit_video:\n(?:    .*\n)+', '  media_kit_video:\n    path: media-kit/media_kit_video\n', s); open(p,'w',encoding='utf-8').write(s)"
+          @'
+          import re
+          p = 'pubspec.yaml'
+          s = open(p, encoding='utf-8').read()
+          s2 = re.sub(
+              r'(?m)^  media_kit_video:\n(?:    [^\n]*\n)+',
+              '  media_kit_video:\n    path: media-kit/media_kit_video\n',
+              s,
+          )
+          assert '\nflutter:\n  uses-material-design: true' in s2, 'pubspec flutter section lost'
+          open(p, 'w', encoding='utf-8').write(s2)
+          '@ | python -
           flutter pub get
 
       - name: Prepare updated libmpv for installer
@@ -62,7 +73,32 @@ jobs:
 
       - name: Build Windows
         run: |
-          fastforge package --platform windows --targets exe --flutter-build-args="dart-define-from-file=pili_release.json,no-pub" --skip-clean
+          fastforge package --platform windows --targets exe --flutter-build-args="dart-define-from-file=pili_release.json,dart-define=PLAYER_DIAGNOSTICS=true,no-pub" --skip-clean
+
+      - name: Verify bundled assets
+        shell: pwsh
+        run: |
+          $root = "build/windows/x64/runner/Release/data/flutter_assets"
+          Write-Host "== flutter_assets directories =="
+          Get-ChildItem $root -Directory | Select-Object -ExpandProperty Name
+          Write-Host "== fonts/ =="
+          Get-ChildItem "$root/fonts" -File -ErrorAction SilentlyContinue |
+            Select-Object Name, Length
+          Write-Host "== assets/fonts/ =="
+          Get-ChildItem "$root/assets/fonts" -File -ErrorAction SilentlyContinue |
+            Select-Object Name, Length
+          Write-Host "== FontManifest.json =="
+          Get-Content "$root/FontManifest.json"
+          $required = @(
+            "$root/fonts/MaterialIcons-Regular.otf",
+            "$root/assets/fonts/custom_icon.ttf",
+            "$root/assets/fonts/digital_id_num.ttf"
+          )
+          foreach ($file in $required) {
+            if (!(Test-Path $file)) {
+              Write-Host "::warning::Missing bundled font: $file"
+            }
+          }
 
       - name: Prepare Upload
         run: |
