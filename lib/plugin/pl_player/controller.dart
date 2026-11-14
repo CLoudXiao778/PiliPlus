@@ -954,14 +954,21 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
 
     assert(!isLive || seekTo == null);
+    // Do not pass the resume position as mpv's `start` option. With the
+    // EDL-based DASH timeline in newer libmpv builds, `start` leaves the
+    // audio timestamps on the old timeline offset; a later backward seek
+    // then makes mpv "reset playback" to the resume position (and lose A/V
+    // sync). Open at 0 and seek explicitly instead.
     await player.open(
       Media(
         video,
-        start: seekTo,
         extras: extras.isEmpty ? null : extras,
       ),
       play: false,
     );
+    if (seekTo != null && seekTo > Duration.zero) {
+      await player.seek(seekTo);
+    }
   }
 
   Future<void>? refreshPlayer() {
@@ -969,9 +976,16 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       return null;
     }
     if (_videoPlayerController case final ctr? when (ctr.current.isNotEmpty)) {
-      var media = ctr.current.last;
-      if (!isLive) media = media.copyWith(start: ctr.state.position);
-      return ctr.open(media, play: true);
+      final position = ctr.state.position;
+      final media = isLive
+          ? ctr.current.last
+          : ctr.current.last.copyWith(start: Duration.zero);
+      return () async {
+        await ctr.open(media, play: true);
+        if (!isLive && position > Duration.zero) {
+          await ctr.seek(position);
+        }
+      }();
     }
     return null;
   }
