@@ -52,6 +52,14 @@ jobs:
           python -c "import re; p='pubspec.yaml'; s=open(p,encoding='utf-8').read(); s=re.sub(r'(?ms)^  media_kit_video:\n(?:    .*\n)+', '  media_kit_video:\n    path: media-kit/media_kit_video\n', s); open(p,'w',encoding='utf-8').write(s)"
           flutter pub get
 
+      - name: Prepare updated libmpv for installer
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261111/mpv-dev-x86_64-20261111-git-bcde6b93cc.7z" -OutFile libmpv.7z
+          7z x libmpv.7z -olibmpv -y
+          New-Item -ItemType Directory -Force C:\libmpv | Out-Null
+          Copy-Item libmpv/libmpv-2.dll C:\libmpv\libmpv-2.dll -Force
+
       - name: Build Windows
         run: |
           fastforge package --platform windows --targets exe --flutter-build-args="dart-define-from-file=pili_release.json,no-pub" --skip-clean
