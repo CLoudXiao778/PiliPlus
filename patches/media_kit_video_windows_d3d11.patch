@@ -1,0 +1,1145 @@
+diff --git a/media_kit_video/windows/CMakeLists.txt b/media_kit_video/windows/CMakeLists.txt
+index bd33504..fab2e49 100644
+--- a/media_kit_video/windows/CMakeLists.txt
++++ b/media_kit_video/windows/CMakeLists.txt
+@@ -2,7 +2,8 @@
+ #
+ # Copyright © 2021 & onwards, Hitesh Kumar Saini <saini123hitesh@gmail.com>.
+ # All rights reserved.
+-# Use of this source code is governed by MIT license that can be found in the LICENSE file.
++# Use of this source code is governed by MIT license that can be found in the
++# LICENSE file.
+ 
+ cmake_minimum_required(VERSION 3.14)
+ 
+@@ -15,7 +16,6 @@ set(PLUGIN_NAME "media_kit_video_plugin")
+ # This is shipped as part of package:media_kit_libs_*** package(s).
+ # Must be built before this target.
+ set(LIBMPV_SRC "${CMAKE_BINARY_DIR}/libmpv")
+-set(ANGLE_SRC "${CMAKE_BINARY_DIR}/ANGLE")
+ 
+ # Deal with MSVC incompatiblity
+ add_compile_definitions(_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
+@@ -23,12 +23,12 @@ add_compile_definitions(_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
+ if(MEDIA_KIT_LIBS_AVAILABLE)
+   include_directories(
+     "${LIBMPV_SRC}/include"
+-    "${ANGLE_SRC}/include"
+   )
+ 
+   add_library(
+     ${PLUGIN_NAME} SHARED
+-    "angle_surface_manager.cc"
++    "d3d11_renderer.cc"
++    "mailbox_swap_chain.cc"
+     "media_kit_video_plugin_c_api.cc"
+     "media_kit_video_plugin.cc"
+     "video_output_manager.cc"
+@@ -58,10 +58,11 @@ if(MEDIA_KIT_LIBS_AVAILABLE)
+     flutter
+     flutter_wrapper_plugin
+ 
+-    # Link to libmpv & ANGLE.
++    # Link to libmpv. The Windows video output renders directly into a
++    # D3D11 texture via MPV_RENDER_API_TYPE_D3D11, so ANGLE is not used.
+     "${LIBMPV_SRC}/libmpv.dll.a"
+-    "${ANGLE_SRC}/lib/libEGL.dll.lib"
+-    "${ANGLE_SRC}/lib/libGLESv2.dll.lib"
++    d3d11
++    dxgi
+   )
+ else()
+   message(NOTICE "media_kit: WARNING: package:media_kit_libs_*** not found.")
+diff --git a/media_kit_video/windows/d3d11_renderer.cc b/media_kit_video/windows/d3d11_renderer.cc
+new file mode 100644
+index 0000000..25d5245
+--- /dev/null
++++ b/media_kit_video/windows/d3d11_renderer.cc
+@@ -0,0 +1,156 @@
++// This file is a part of media_kit
++// (https://github.com/media-kit/media-kit).
++//
++// Copyright © 2026 Predidit.
++// All rights reserved.
++// Use of this source code is governed by MIT license that can be found in the
++// LICENSE file.
++
++#include "d3d11_renderer.h"
++
++#include <iostream>
++#include <iterator>
++#include <stdexcept>
++
++#pragma comment(lib, "dxgi.lib")
++#pragma comment(lib, "d3d11.lib")
++
++int D3D11Renderer::instance_count_ = 0;
++
++D3D11Renderer::D3D11Renderer(int32_t width, int32_t height,
++                             IDXGIAdapter* flutter_adapter)
++    : width_(width), height_(height) {
++  if (!CreateD3D11Device(flutter_adapter)) {
++    throw std::runtime_error("Unable to create Direct3D 11 device.");
++  }
++  if (!CreateMailbox()) {
++    throw std::runtime_error("Unable to create mailbox swap chain.");
++  }
++  instance_count_++;
++}
++
++D3D11Renderer::~D3D11Renderer() {
++  mailbox_swap_chain_.reset();
++  d3d_11_device_context_.Reset();
++  d3d_11_device_.Reset();
++  instance_count_--;
++}
++
++void D3D11Renderer::SetSize(int32_t width, int32_t height) {
++  if (width == width_ && height == height_) return;
++  width_ = width;
++  height_ = height;
++  if (mailbox_swap_chain_) {
++    const HRESULT hr = mailbox_swap_chain_->Resize(width_, height_);
++    if (FAILED(hr)) {
++      std::cout << "media_kit: D3D11Renderer: Mailbox resize failed (hr=0x"
++                << std::hex << hr << std::dec << ")" << std::endl;
++    }
++  }
++}
++
++void D3D11Renderer::ProducerCommit() {
++  if (mailbox_swap_chain_) {
++    mailbox_swap_chain_->ProducerCommit();
++  }
++}
++
++HANDLE D3D11Renderer::ConsumerAcquire() {
++  if (mailbox_swap_chain_) {
++    return mailbox_swap_chain_->ConsumerAcquire();
++  }
++  return nullptr;
++}
++
++HANDLE D3D11Renderer::ReadHandleSnapshot() const {
++  if (mailbox_swap_chain_) {
++    return mailbox_swap_chain_->ReadHandleSnapshot();
++  }
++  return nullptr;
++}
++
++bool D3D11Renderer::CreateD3D11Device(IDXGIAdapter* flutter_adapter) {
++  if (d3d_11_device_) return true;
++
++  const D3D_FEATURE_LEVEL feature_levels[] = {
++      D3D_FEATURE_LEVEL_11_1,
++      D3D_FEATURE_LEVEL_11_0,
++      D3D_FEATURE_LEVEL_10_1,
++      D3D_FEATURE_LEVEL_10_0,
++      D3D_FEATURE_LEVEL_9_3,
++  };
++
++  // FlutterView::GetGraphicsAdapter() returns a new reference; Attach takes
++  // ownership of it (ComPtr's raw-pointer constructor would AddRef and leak).
++  Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
++  if (flutter_adapter) {
++    adapter.Attach(flutter_adapter);
++  }
++  D3D_DRIVER_TYPE driver_type = D3D_DRIVER_TYPE_UNKNOWN;
++
++  if (!adapter) {
++    if (Utils::IsWindows10RTMOrGreater()) {
++      driver_type = D3D_DRIVER_TYPE_HARDWARE;
++    } else {
++      Microsoft::WRL::ComPtr<IDXGIFactory> dxgi;
++      ::CreateDXGIFactory(__uuidof(IDXGIFactory), (void**)&dxgi);
++      if (dxgi) {
++        dxgi->EnumAdapters(0, &adapter);
++      }
++    }
++  } else {
++    std::cout << "media_kit: D3D11Renderer: Using Flutter's DXGI adapter."
++              << std::endl;
++  }
++
++  // D3D11_CREATE_DEVICE_VIDEO_SUPPORT is required for d3d11va zero-copy
++  // decoding on the same device (mpv's d3d11va hwdec uses this device).
++  // Retry without it on systems where the flag is rejected.
++  UINT create_flags =
++      D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
++  HRESULT hr = ::D3D11CreateDevice(
++      adapter.Get(), driver_type, nullptr, create_flags, feature_levels,
++      static_cast<UINT>(std::size(feature_levels)), D3D11_SDK_VERSION,
++      d3d_11_device_.GetAddressOf(), nullptr,
++      d3d_11_device_context_.GetAddressOf());
++  if (FAILED(hr)) {
++    create_flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
++    hr = ::D3D11CreateDevice(
++        adapter.Get(), driver_type, nullptr, create_flags, feature_levels,
++        static_cast<UINT>(std::size(feature_levels)), D3D11_SDK_VERSION,
++        d3d_11_device_.GetAddressOf(), nullptr,
++        d3d_11_device_context_.GetAddressOf());
++  }
++
++  if (FAILED(hr)) {
++    std::cout << "media_kit: D3D11Renderer: D3D11CreateDevice failed (hr=0x"
++              << std::hex << hr << std::dec << ")" << std::endl;
++    return false;
++  }
++
++  Microsoft::WRL::ComPtr<IDXGIDevice> dxgi_device;
++  if (SUCCEEDED(d3d_11_device_->QueryInterface(__uuidof(IDXGIDevice),
++                                               (void**)&dxgi_device)) &&
++      dxgi_device) {
++    dxgi_device->SetGPUThreadPriority(5);
++  }
++
++  const auto level = d3d_11_device_->GetFeatureLevel();
++  std::cout << "media_kit: D3D11Renderer: Direct3D Feature Level: "
++            << (static_cast<unsigned>(level) >> 12) << "_"
++            << ((static_cast<unsigned>(level) >> 8) & 0xfu) << std::endl;
++
++  return true;
++}
++
++bool D3D11Renderer::CreateMailbox() {
++  const HRESULT hr = MailboxSwapChain::Create(d3d_11_device_.Get(), width_,
++                                              height_, &mailbox_swap_chain_);
++  if (FAILED(hr)) {
++    std::cout << "media_kit: D3D11Renderer: MailboxSwapChain::Create failed "
++                 "(hr=0x"
++              << std::hex << hr << std::dec << ")" << std::endl;
++    return false;
++  }
++  return true;
++}
+\ No newline at end of file
+diff --git a/media_kit_video/windows/d3d11_renderer.h b/media_kit_video/windows/d3d11_renderer.h
+new file mode 100644
+index 0000000..43faa8d
+--- /dev/null
++++ b/media_kit_video/windows/d3d11_renderer.h
+@@ -0,0 +1,99 @@
++﻿// This file is a part of media_kit
++// (https://github.com/media-kit/media-kit).
++//
++// Copyright © Predidit.
++// All rights reserved.
++// Use of this source code is governed by MIT license that can be found in the
++// LICENSE file.
++
++#ifndef D3D11_RENDERER_H_
++#define D3D11_RENDERER_H_
++
++#include <Windows.h>
++#include <d3d11.h>
++#include <dxgi.h>
++#include <dxgi1_2.h>
++#include <wrl.h>
++
++#include <cstdint>
++#include <iostream>
++#include <memory>
++
++#include "mailbox_swap_chain.h"
++#include "utils.h"
++
++// D3D11Renderer creates a D3D11 device and owns a MailboxSwapChain that
++// implements the lock-free triple-buffer mailbox between the libmpv rendering
++// thread (producer) and Flutter's render thread (consumer).
++//
++// The device is handed to mpv through mpv_d3d11_init_params.  For every frame
++// the plugin passes render_target() to mpv_render_context_render() as
++// mpv_d3d11_fbo::tex and mpv submits its GPU work into it.  The plugin then
++// calls ProducerCommit(), which (a) signals a fence on the submitted work,
++// (b) non-blockingly checks the *previous* frame's fence and, if already
++// GPU-complete, promotes it to latest_completed_slot_, and (c) atomically
++// publishes write_slot_ as the new pending frame.  Flutter's
++// GpuSurfaceTexture callback calls ConsumerAcquire() — a single acquire
++// load of latest_completed_slot_ — to receive the DXGI shared HANDLE of
++// the newest confirmed frame, with no copy, no flush, and no OS lock.
++class D3D11Renderer {
++ public:
++  int32_t width() const { return width_; }
++  int32_t height() const { return height_; }
++
++  // Raw device pointer used by VideoOutput to populate mpv_d3d11_init_params.
++  ID3D11Device* device() const { return d3d_11_device_.Get(); }
++
++  // Mailbox slot the next frame must be rendered into, passed to mpv as
++  // mpv_d3d11_fbo::tex.  Borrowed pointer, valid until the next
++  // ProducerCommit() or SetSize().  Producer thread only.
++  ID3D11Texture2D* render_target() const {
++    return mailbox_swap_chain_ ? mailbox_swap_chain_->ProducerTexture()
++                               : nullptr;
++  }
++
++  // |flutter_adapter| is the IDXGIAdapter* returned by
++  // FlutterDesktopViewGetGraphicsAdapter.  When non-null the D3D11 device is
++  // created on exactly that adapter so the plugin always shares the same GPU
++  // as the Flutter compositor.  Pass nullptr to fall back to the legacy
++  // heuristic (hardware default on Win10+, adapter 0 on older Windows).
++  explicit D3D11Renderer(int32_t width, int32_t height,
++                         IDXGIAdapter* flutter_adapter = nullptr);
++  ~D3D11Renderer();
++
++  // Recreates the mailbox slots at the new dimensions.
++  // Must be called from the producer thread only.
++  void SetSize(int32_t width, int32_t height);
++
++  // Called from the producer thread (mpv thread pool) after
++  // mpv_render_context_render returns.  Signals the frame fence, then
++  // non-blockingly attempts to promote the previous pending frame to
++  // latest_completed_slot_, and finally publishes the new pending frame.
++  void ProducerCommit();
++
++  // Called from the consumer thread (Flutter GpuSurfaceTexture callback).
++  // Returns the DXGI shared HANDLE of the most recent fence-confirmed frame
++  // via a single atomic load — no fence poll, no flush, no stall.
++  HANDLE ConsumerAcquire();
++
++  // Returns the DXGI shared HANDLE for the current read slot without
++  // advancing mailbox state.  Used once during texture registration before
++  // the consumer thread starts.
++  HANDLE ReadHandleSnapshot() const;
++
++ private:
++  bool CreateD3D11Device(IDXGIAdapter* flutter_adapter);
++  bool CreateMailbox();
++
++  int32_t width_ = 1;
++  int32_t height_ = 1;
++
++  Microsoft::WRL::ComPtr<ID3D11Device> d3d_11_device_;
++  Microsoft::WRL::ComPtr<ID3D11DeviceContext> d3d_11_device_context_;
++
++  std::unique_ptr<MailboxSwapChain> mailbox_swap_chain_;
++
++  static int instance_count_;
++};
++
++#endif  // D3D11_RENDERER_H_
+\ No newline at end of file
+diff --git a/media_kit_video/windows/mailbox_swap_chain.cc b/media_kit_video/windows/mailbox_swap_chain.cc
+new file mode 100644
+index 0000000..7397e23
+--- /dev/null
++++ b/media_kit_video/windows/mailbox_swap_chain.cc
+@@ -0,0 +1,214 @@
++﻿// This file is a part of media_kit
++// (https://github.com/media-kit/media-kit).
++//
++// Copyright © 2026 Predidit.
++// All rights reserved.
++// Use of this source code is governed by MIT license that can be found in the
++// LICENSE file.
++
++#include "mailbox_swap_chain.h"
++
++#include <iostream>
++#include <new>
++
++MailboxSwapChain::~MailboxSwapChain() {
++  ReleaseSlots();
++}
++
++HRESULT MailboxSwapChain::Create(ID3D11Device* device,
++                                  int32_t width,
++                                  int32_t height,
++                                  std::unique_ptr<MailboxSwapChain>* out) {
++  if (!device || !out) return E_INVALIDARG;
++
++  std::unique_ptr<MailboxSwapChain> p(new (std::nothrow) MailboxSwapChain());
++  if (!p) return E_OUTOFMEMORY;
++
++  p->device_ = device;
++  p->width_ = (width > 0) ? width : 1;
++  p->height_ = (height > 0) ? height : 1;
++
++  {
++    Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx;
++    device->GetImmediateContext(&ctx);
++    const HRESULT hr2 = ctx.As(&p->context4_);
++    if (FAILED(hr2)) {
++      std::cout << "media_kit: MailboxSwapChain: ID3D11DeviceContext4 not available "
++                   "(hr=0x" << std::hex << hr2 << std::dec << ")" << std::endl;
++      return hr2;
++    }
++  }
++
++  const HRESULT hr = p->AllocateSlots();
++  if (FAILED(hr)) {
++    return hr;
++  }
++
++  *out = std::move(p);
++  return S_OK;
++}
++
++void MailboxSwapChain::ProducerCommit() {
++  auto& ws = slots_[write_slot_];
++  context4_->Signal(ws.fence.Get(), ++ws.fence_value);
++
++  // This runs one full render-cycle after the *previous* Signal was enqueued.
++  // By then the D3D11 runtime has had ample opportunity to submit the prior
++  // command buffer to the GPU, so GetCompletedValue() is far more likely to
++  // have advanced than it would be inside ConsumerAcquire (which can be
++  // called microseconds after the Signal).  The check is non-blocking: if
++  // the fence isn't done yet, we simply leave latest_completed_slot_ as-is
++  // and try again next frame.
++  //
++  // On success we do a combined promotion CAS on mailbox_state_:
++  //   (has_pending=1, pending=P, completed=C, free=F)
++  //   → (has_pending=0, extra=C, completed=P, free=F)
++  // then store latest_completed_slot_ = P with release ordering so that
++  // ConsumerAcquire's acquire load cannot observe P before mailbox_state_
++  // reflects P in the 'completed' role (i.e., protected from the producer).
++  {
++    uint32_t snap = mailbox_state_.load(std::memory_order_acquire);
++    if (snap & (1u << 6)) {  // has_pending
++      const int pend = static_cast<int>((snap >> 4) & 0x3u);
++      const int comp = static_cast<int>((snap >> 2) & 0x3u);
++      const int fr   = static_cast<int>( snap        & 0x3u);
++      if (slots_[pend].fence->GetCompletedValue() >=
++          slots_[pend].fence_value) {
++        const uint32_t snap_desired =
++            (static_cast<uint32_t>(comp) << 4) |
++            (static_cast<uint32_t>(pend) << 2) |
++            static_cast<uint32_t>(fr);
++        if (mailbox_state_.compare_exchange_strong(
++                snap, snap_desired,
++                std::memory_order_acq_rel,
++                std::memory_order_relaxed)) {
++          latest_completed_slot_.store(pend, std::memory_order_release);
++        }
++        // CAS failure means no concurrent writer exists (ProducerCommit is
++        // called from a single producer thread); the only way it can fail is
++        // if mailbox_state_ was already has_pending=0, which means nothing
++        // to promote.  Either way, leave latest_completed_slot_ untouched.
++      }
++    }
++  }
++
++  // Desired state:
++  //   has_pending = 1
++  //   pending     = write_slot_          (new latest frame)
++  //   completed   = old completed_slot   (unchanged)
++  //   free        = old pending_or_extra (recycled: was old pending or extra_free)
++  //
++  // new write_slot_ (producer-private) = old free_slot.
++  uint32_t expected = mailbox_state_.load(std::memory_order_relaxed);
++  while (true) {
++    const int old_free      = static_cast<int>( expected        & 0x3u);
++    const int old_completed = static_cast<int>((expected >> 2)  & 0x3u);
++    const int old_poe       = static_cast<int>((expected >> 4)  & 0x3u);
++    const uint32_t desired =
++        (1u << 6) |
++        (static_cast<uint32_t>(write_slot_)   << 4) |
++        (static_cast<uint32_t>(old_completed) << 2) |
++        static_cast<uint32_t>(old_poe);
++    if (mailbox_state_.compare_exchange_weak(
++            expected, desired,
++            std::memory_order_release,
++            std::memory_order_relaxed)) {
++      write_slot_ = old_free;
++      break;
++    }
++  }
++}
++
++HANDLE MailboxSwapChain::ConsumerAcquire() {
++  // Always return the most recently fence-confirmed frame.
++  // Advancement is handled exclusively by ProducerCommit (called one full
++  // render-cycle after each Signal, where fence completion is far more
++  // likely).
++  return slots_[latest_completed_slot_.load(std::memory_order_acquire)]
++      .shared_handle;
++}
++
++HRESULT MailboxSwapChain::Resize(int32_t width, int32_t height) {
++  ReleaseSlots();
++  width_ = (width > 0) ? width : 1;
++  height_ = (height > 0) ? height : 1;
++  mailbox_state_.store(57u, std::memory_order_relaxed);
++  latest_completed_slot_.store(2, std::memory_order_relaxed);
++  write_slot_ = 0;
++  return AllocateSlots();
++}
++
++HRESULT MailboxSwapChain::AllocateSlots() {
++  Microsoft::WRL::ComPtr<ID3D11Device5> device5;
++  {
++    const HRESULT hr =
++        device_->QueryInterface(__uuidof(ID3D11Device5), (void**)&device5);
++    if (FAILED(hr)) {
++      std::cout << "media_kit: MailboxSwapChain: ID3D11Device5 not available "
++                   "(hr=0x" << std::hex << hr << std::dec << ")" << std::endl;
++      return hr;
++    }
++  }
++
++  D3D11_TEXTURE2D_DESC desc = {};
++  desc.Width = static_cast<UINT>(width_);
++  desc.Height = static_cast<UINT>(height_);
++  desc.MipLevels = 1;
++  desc.ArraySize = 1;
++  desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++  desc.SampleDesc.Count = 1;
++  desc.SampleDesc.Quality = 0;
++  desc.Usage = D3D11_USAGE_DEFAULT;
++  desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
++  desc.CPUAccessFlags = 0;
++  desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
++
++  for (int i = 0; i < 4; ++i) {
++    HRESULT hr = device_->CreateTexture2D(&desc, nullptr, &slots_[i].texture);
++    if (FAILED(hr)) {
++      std::cout << "media_kit: MailboxSwapChain: CreateTexture2D slot " << i
++                << " failed (hr=0x" << std::hex << hr << std::dec << ")"
++                << std::endl;
++      return hr;
++    }
++
++    Microsoft::WRL::ComPtr<IDXGIResource> resource;
++    hr = slots_[i].texture.As(&resource);
++    if (FAILED(hr)) {
++      std::cout << "media_kit: MailboxSwapChain: As<IDXGIResource> slot " << i
++                << " failed (hr=0x" << std::hex << hr << std::dec << ")"
++                << std::endl;
++      return hr;
++    }
++
++    hr = resource->GetSharedHandle(&slots_[i].shared_handle);
++    if (FAILED(hr)) {
++      std::cout << "media_kit: MailboxSwapChain: GetSharedHandle slot " << i
++                << " failed (hr=0x" << std::hex << hr << std::dec << ")"
++                << std::endl;
++      return hr;
++    }
++
++    hr = device5->CreateFence(0, D3D11_FENCE_FLAG_NONE,
++                              __uuidof(ID3D11Fence),
++                              (void**)&slots_[i].fence);
++    if (FAILED(hr)) {
++      std::cout << "media_kit: MailboxSwapChain: CreateFence slot " << i
++                << " failed (hr=0x" << std::hex << hr << std::dec << ")"
++                << std::endl;
++      return hr;
++    }
++    slots_[i].fence_value = 0;
++  }
++
++  return S_OK;
++}
++
++void MailboxSwapChain::ReleaseSlots() {
++  for (auto& slot : slots_) {
++    slot.texture.Reset();
++    slot.shared_handle = nullptr;
++    slot.fence.Reset();
++    slot.fence_value = 0;
++  }
++}
+\ No newline at end of file
+diff --git a/media_kit_video/windows/mailbox_swap_chain.h b/media_kit_video/windows/mailbox_swap_chain.h
+new file mode 100644
+index 0000000..150ca96
+--- /dev/null
++++ b/media_kit_video/windows/mailbox_swap_chain.h
+@@ -0,0 +1,125 @@
++﻿// This file is a part of media_kit
++// (https://github.com/media-kit/media-kit).
++//
++// Copyright © 2026 Predidit.
++// All rights reserved.
++// Use of this source code is governed by MIT license that can be found in the
++// LICENSE file.
++
++#ifndef MAILBOX_SWAP_CHAIN_H_
++#define MAILBOX_SWAP_CHAIN_H_
++
++#include <Windows.h>
++#include <d3d11.h>
++#include <d3d11_4.h>
++#include <dxgi.h>
++#include <wrl.h>
++
++#include <atomic>
++#include <cstdint>
++#include <memory>
++
++// Lock-free 4-slot mailbox of render targets with a last-completed-frame
++// cache.  The producer hands ProducerTexture() to libmpv as the D3D11 render
++// target of each frame; the consumer reads the newest GPU-complete slot.
++//
++// Four BGRA8 textures are kept, each with a DXGI shared HANDLE.
++// mailbox_state_ is a single atomic<uint32_t>:
++//   bits [1:0] = free_slot         (0-3): producer takes this for the next frame
++//   bits [3:2] = completed_slot    (0-3): most recent fence-confirmed frame;
++//                                          safe Consumer fallback at any time
++//   bits [5:4] = pending_or_extra  (0-3): has_pending=1 → latest submitted frame
++//                                          (fence may still be in-flight);
++//                                          has_pending=0 → second free slot
++//   bit  [6]   = has_pending            : 1 = a new frame is waiting to be consumed
++//
++// 4-slot invariant (all roles are always distinct):
++//   has_pending=1: write_slot_(private) | free | pending | completed  = 4 slots
++//   has_pending=0: write_slot_(private) | free | extra_free | completed = 4 slots
++//
++// Initial value 57u = 0b0_11_10_01:
++//   has_pending=0, extra_free=3, completed=2, free=1, write_slot_=0 (private)
++class MailboxSwapChain final {
++ public:
++  // device must outlive the returned mailbox.
++  static HRESULT Create(ID3D11Device* device,
++                        int32_t width,
++                        int32_t height,
++                        std::unique_ptr<MailboxSwapChain>* out);
++
++  ~MailboxSwapChain();
++
++  // Render target of the frame being produced, passed to libmpv as
++  // mpv_d3d11_fbo::tex.  Borrowed pointer, valid until the next
++  // ProducerCommit() or Resize().  Producer thread only.
++  ID3D11Texture2D* ProducerTexture() const {
++    return slots_[write_slot_].texture.Get();
++  }
++
++  // Called from the producer thread after mpv_render_context_render returns.
++  // In addition to publishing write_slot_ as the new pending frame, it
++  // non-blockingly polls the *previous* pending frame's fence and, if the GPU
++  // has already completed it, promotes it to completed and updates
++  // latest_completed_slot_ (release store).  This is the sole site that
++  // advances latest_completed_slot_; ConsumerAcquire never touches the fence.
++  void ProducerCommit();
++
++  // Called from the consumer thread (Flutter GpuSurfaceTexture callback).
++  // Returns the DXGI shared HANDLE of the most recent fence-confirmed frame.
++  // Implementation is a single acquire load of latest_completed_slot_ —
++  // no CAS, no fence poll, no flush, no stall, no KeyedMutex.
++  HANDLE ConsumerAcquire();
++
++  // Recreates all texture slots at the new dimensions.
++  // Must only be called from the producer thread with no active consumer.
++  HRESULT Resize(int32_t width, int32_t height);
++
++  // Returns the latest GPU-confirmed HANDLE without advancing mailbox state.
++  // Safe to call before the consumer thread starts.
++  HANDLE ReadHandleSnapshot() const {
++    return slots_[latest_completed_slot_.load(std::memory_order_acquire)]
++        .shared_handle;
++  }
++
++  int32_t width() const { return width_; }
++  int32_t height() const { return height_; }
++
++ private:
++  MailboxSwapChain() = default;
++
++  MailboxSwapChain(const MailboxSwapChain&) = delete;
++  MailboxSwapChain& operator=(const MailboxSwapChain&) = delete;
++
++  HRESULT AllocateSlots();
++  void ReleaseSlots();
++
++  struct TextureSlot {
++    Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
++    HANDLE shared_handle = nullptr;
++    Microsoft::WRL::ComPtr<ID3D11Fence> fence;
++    uint64_t fence_value = 0;
++  };
++
++  ID3D11Device* device_ = nullptr;
++  Microsoft::WRL::ComPtr<ID3D11DeviceContext4> context4_;
++
++  int32_t width_ = 1;
++  int32_t height_ = 1;
++
++  TextureSlot slots_[4];
++
++  // Lock-free mailbox state — see bit-field comment at top of class.
++  // Initial value 57u = 0b0_11_10_01.
++  std::atomic<uint32_t> mailbox_state_{57u};
++
++  // Cache of the most recently fence-confirmed completed slot.
++  // ConsumerAcquire reads this directly (one atomic load, no CAS, no fence
++  // poll).  Updated by ProducerCommit after a successful non-blocking
++  // pending→completed promotion.  Initialised to 2, which matches the
++  // 'completed' field in mailbox_state_'s initial value 57u.
++  std::atomic<int> latest_completed_slot_{2};
++
++  int write_slot_ = 0;  // producer-private
++};
++
++#endif  // MAILBOX_SWAP_CHAIN_H_
+\ No newline at end of file
+diff --git a/media_kit_video/windows/render_d3d11.h b/media_kit_video/windows/render_d3d11.h
+new file mode 100644
+index 0000000..7fa4c12
+--- /dev/null
++++ b/media_kit_video/windows/render_d3d11.h
+@@ -0,0 +1,118 @@
++/* Copyright (C) 2024 the mpv developers
++ *
++ * Permission to use, copy, modify, and/or distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#ifndef MPV_CLIENT_API_RENDER_D3D11_H_
++#define MPV_CLIENT_API_RENDER_D3D11_H_
++
++#include "render.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/**
++ * Direct3D 11 backend
++ * -------------------
++ *
++ * This header contains definitions for using Direct3D 11 with the render.h
++ * API.
++ *
++ * API use
++ * -------
++ *
++ * The mpv_render_* API is used. That API supports multiple backends, and this
++ * section documents specifics for the Direct3D 11 backend.
++ *
++ * Use mpv_render_context_create() with MPV_RENDER_PARAM_API_TYPE set to
++ * MPV_RENDER_API_TYPE_D3D11, and MPV_RENDER_PARAM_D3D11_INIT_PARAMS provided.
++ *
++ * Call mpv_render_context_render() with MPV_RENDER_PARAM_D3D11_FBO to render
++ * the video frame to a D3D11 texture. The API user is responsible for creating
++ * and presenting the texture (for example, via a DXGI swap chain).
++ *
++ * Direct3D 11 state
++ * -----------------
++ *
++ * mpv renders with the immediate context of the device and does not restore
++ * its state, so the API user has to set its own state again after calling the
++ * mpv_render_* functions. State that mpv does not set, like the geometry, hull
++ * and domain shader stages, must be at the defaults that
++ * ID3D11DeviceContext::ClearState() sets.
++ *
++ * Threading
++ * ---------
++ *
++ * Unlike OpenGL, Direct3D 11 does not use a per-thread implicit context. Any
++ * thread may call the mpv_render_* functions with this backend, subject to the
++ * general restrictions described in render.h. Other threads must not use the
++ * immediate context while an mpv_render_* function runs.
++ *
++ * Hardware decoding
++ * -----------------
++ *
++ * d3d11va decodes on the device passed in mpv_d3d11_init_params from mpv's
++ * decoder thread, and mpv enables multithread protection on the device for it.
++ * A device created with D3D11_CREATE_DEVICE_SINGLETHREADED does not support
++ * this, so only copy-back hardware decoding like d3d11va-copy works with it.
++ */
++
++/**
++ * For initializing the mpv D3D11 state via MPV_RENDER_PARAM_D3D11_INIT_PARAMS.
++ */
++typedef struct mpv_d3d11_init_params {
++    /**
++     * The ID3D11Device to use for rendering. libmpv will add a reference to
++     * the device, so it is safe to release the caller's reference after
++     * mpv_render_context_create() returns.
++     *
++     * Type: ID3D11Device*
++     */
++    void *device;
++} mpv_d3d11_init_params;
++
++/**
++ * For MPV_RENDER_PARAM_D3D11_FBO.
++ */
++typedef struct mpv_d3d11_fbo {
++    /**
++     * The D3D11 texture to render into. This must be a 2D texture
++     * (ID3D11Texture2D) created on the same ID3D11Device that was passed to
++     * mpv_render_context_create() via mpv_d3d11_init_params.
++     *
++     * The texture must have been created with at least the
++     * D3D11_BIND_RENDER_TARGET bind flag and D3D11_USAGE_DEFAULT usage. It
++     * must not be multisampled, a texture array, or mipmapped. Formats like
++     * DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
++     * DXGI_FORMAT_R10G10B10A2_UNORM and DXGI_FORMAT_R16G16B16A16_FLOAT are
++     * supported. sRGB formats are not supported.
++     *
++     * The texture is owned by the caller. mpv_render_context_render() submits
++     * all its rendering to the immediate context before it returns, and keeps
++     * no reference to the texture. Later work on the same device, like
++     * presenting the texture or resizing its swap chain, needs no further
++     * synchronization. If another device uses the texture, the API user has to
++     * synchronize the access, for example with a keyed mutex acquired around
++     * mpv_render_context_render().
++     *
++     * Type: ID3D11Texture2D*
++     */
++    void *tex;
++} mpv_d3d11_fbo;
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/media_kit_video/windows/video_output.cc b/media_kit_video/windows/video_output.cc
+index 1153ce0..3ab4ef1 100644
+--- a/media_kit_video/windows/video_output.cc
++++ b/media_kit_video/windows/video_output.cc
+@@ -27,59 +27,71 @@ VideoOutput::VideoOutput(int64_t handle,
+       configuration_(configuration),
+       registrar_(registrar),
+       thread_pool_ref_(thread_pool_ref) {
+-  // The constructor must be invoked through the thread pool, because
+-  // |ANGLESurfaceManager| & libmpv render context creation can conflict with
+-  // the existing |Render| or |Resize| calls from another |VideoOutput|
+-  // instances (which will result in access violation).
++  // The constructor must be invoked through the thread pool.
+   auto future = thread_pool_ref_->Post([&]() {
+     mpv_set_option_string(handle_, "video-sync", "audio");
+     mpv_set_option_string(handle_, "video-timing-offset", "0");
+-    // First try to initialize video playback with hardware acceleration &
+-    // |ANGLESurfaceManager|, use S/W API as fallback.
++    
++    // Initialize video playback with hardware acceleration using native D3D11.
+     auto is_hardware_acceleration_enabled = false;
+-    // Attempt to use H/W rendering.
++    
+     if (configuration.enable_hardware_acceleration) {
+       try {
+-        // OpenGL context needs to be set before |mpv_render_context_create|.
+-        surface_manager_ = std::make_unique<ANGLESurfaceManager>(
++        IDXGIAdapter* flutter_adapter = nullptr;
++        if (auto* view = registrar_->GetView()) {
++          flutter_adapter = view->GetGraphicsAdapter();
++        }
++        d3d11_renderer_ = std::make_unique<D3D11Renderer>(
+             static_cast<int32_t>(width_.value_or(1)),
+-            static_cast<int32_t>(height_.value_or(1)));
+-        surface_manager_->MakeCurrent(true);
+-        Resize(width_.value_or(1), height_.value_or(1));
+-        mpv_opengl_init_params gl_init_params{
+-            [](auto, auto name) {
+-              return reinterpret_cast<void*>(eglGetProcAddress(name));
+-            },
+-            nullptr,
+-        };
++            static_cast<int32_t>(height_.value_or(1)),
++            flutter_adapter);
++        
++        // Initialize mpv with the D3D11 device. The render target is supplied
++        // per frame through MPV_RENDER_PARAM_D3D11_FBO in Render().
++        mpv_d3d11_init_params init_params = {d3d11_renderer_->device()};
++
+         mpv_render_param params[] = {
+-            {MPV_RENDER_PARAM_API_TYPE, MPV_RENDER_API_TYPE_OPENGL},
+-            {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, &gl_init_params},
++            {MPV_RENDER_PARAM_API_TYPE, MPV_RENDER_API_TYPE_D3D11},
++            {MPV_RENDER_PARAM_D3D11_INIT_PARAMS, &init_params},
+             {MPV_RENDER_PARAM_INVALID, nullptr},
+         };
++        
+         // Create render context.
+         if (mpv_render_context_create(&render_context_, handle_, params) == 0) {
+           mpv_render_context_set_update_callback(
+               render_context_,
+               [](void* context) {
+-                // Notify Flutter that a new frame is available. The actual
+-                // rendering will take place in the |Render| method, which will
+-                // be called by Flutter on the render thread.
+                 auto that = reinterpret_cast<VideoOutput*>(context);
+                 that->NotifyRender();
+               },
+               reinterpret_cast<void*>(this));
++          
++          // Now create the Flutter texture after successful render context creation
++          Resize(width_.value_or(1), height_.value_or(1));
++          
+           // Set flag to true, indicating that H/W rendering is supported.
+           is_hardware_acceleration_enabled = true;
+-          std::cout << "media_kit: VideoOutput: Using H/W rendering."
++          std::cout << "media_kit: VideoOutput: Using native D3D11 H/W rendering."
+                     << std::endl;
++        } else {
++          std::cout << "media_kit: VideoOutput: Failed to create mpv render context."
++                    << std::endl;
++          d3d11_renderer_.reset(nullptr);
+         }
++      } catch (const std::exception& e) {
++        // Fallback to software rendering.
++        std::cout << "media_kit: VideoOutput: Failed to initialize D3D11: " 
++                  << e.what() << ", falling back to S/W."
++                  << std::endl;
++        d3d11_renderer_.reset(nullptr);
+       } catch (...) {
+-        // Do nothing.
+-        // Likely received an |std::runtime_error| from |ANGLESurfaceManager|,
+-        // which indicates that H/W rendering is not supported.
++        // Fallback to software rendering.
++        std::cout << "media_kit: VideoOutput: Failed to initialize D3D11, falling back to S/W."
++                  << std::endl;
++        d3d11_renderer_.reset(nullptr);
+       }
+     }
++    
+     if (!is_hardware_acceleration_enabled) {
+       std::cout << "media_kit: VideoOutput: Using S/W rendering." << std::endl;
+       // Allocate a "large enough" buffer ahead of time.
+@@ -94,9 +106,6 @@ VideoOutput::VideoOutput(int64_t handle,
+         mpv_render_context_set_update_callback(
+             render_context_,
+             [](void* context) {
+-              // Notify Flutter that a new frame is available. The actual
+-              // rendering will take place in the |Render| method, which will be
+-              // called by Flutter on the render thread.
+               auto that = reinterpret_cast<VideoOutput*>(context);
+               that->NotifyRender();
+             },
+@@ -109,15 +118,14 @@ VideoOutput::VideoOutput(int64_t handle,
+ 
+ VideoOutput::~VideoOutput() {
+   destroyed_ = true;
++  if (render_context_) {
++    // Stop the producer before draining queued tasks that borrow this object.
++    mpv_render_context_set_update_callback(render_context_, nullptr, nullptr);
++  }
+   auto promise = std::promise<void>();
+   if (texture_id_) {
+     registrar_->texture_registrar()->UnregisterTexture(
+         texture_id_, [&, texture_id = texture_id_]() {
+-          // Add one more task into the thread pool queue & exit the destructor
+-          // only when it gets executed. This will ensure that all the tasks
+-          // posted to the thread pool i.e. render or resize before this are
+-          // executed (and won't reference the dead object anymore), most
+-          // notably |CheckAndResize| & |Render|.
+           auto future = thread_pool_ref_->Post([&, id = texture_id]() {
+             std::cout << "media_kit: VideoOutput: Free Texture: " << id
+                       << std::endl;
+@@ -129,22 +137,18 @@ VideoOutput::~VideoOutput() {
+             textures_.clear();
+             // S/W
+             pixel_buffer_textures_.clear();
+-            // Free (call destructor) |ANGLESurfaceManager| through the thread
+-            // pool. This will ensure synchronized EGL or ANGLE usage & won't
+-            // conflict with |Render| or |CheckAndResize| of other
+-            // |VideoOutput|s.
+-            surface_manager_.reset(nullptr);
++            // Free D3D11Renderer through the thread pool
++            d3d11_renderer_.reset(nullptr);
+             promise.set_value();
+           });
+         });
++    promise.get_future().wait();
+   }
+-
+-  promise.get_future().wait();
+   texture_id_ = 0;
+ 
+   thread_pool_ref_->Post([render_context = render_context_]() {
+-    mpv_render_context_free(render_context);
+-  });
++    if (render_context) mpv_render_context_free(render_context);
++  }).wait();
+ }
+ 
+ void VideoOutput::NotifyRender() {
+@@ -158,20 +162,19 @@ void VideoOutput::NotifyRender() {
+ void VideoOutput::Render() {
+   if (texture_id_) {
+     // H/W
+-    if (surface_manager_ != nullptr) {
+-      surface_manager_->Draw([&]() {
+-        mpv_opengl_fbo fbo{
+-            0,
+-            surface_manager_->width(),
+-            surface_manager_->height(),
+-            0,
+-        };
+-        mpv_render_param params[]{
+-            {MPV_RENDER_PARAM_OPENGL_FBO, &fbo},
+-            {MPV_RENDER_PARAM_INVALID, nullptr},
+-        };
+-        mpv_render_context_render(render_context_, params);
+-      });
++    if (d3d11_renderer_ != nullptr) {
++      // mpv renders into the mailbox slot owned by the producer and flushes
++      // its work to the immediate context before returning.
++      mpv_d3d11_fbo fbo = {d3d11_renderer_->render_target()};
++      mpv_render_param params[]{
++          {MPV_RENDER_PARAM_D3D11_FBO, &fbo},
++          {MPV_RENDER_PARAM_INVALID, nullptr},
++      };
++      // Publish the slot only if mpv actually rendered into it.
++      if (mpv_render_context_render(render_context_, params) >= 0) {
++        mpv_render_context_report_swap(render_context_);
++        d3d11_renderer_->ProducerCommit();
++      }
+     }
+     // S/W
+     if (pixel_buffer_ != nullptr) {
+@@ -209,7 +212,7 @@ void VideoOutput::SetSize(std::optional<int64_t> width,
+   thread_pool_ref_->Post([&, width, height]() {
+     if (width.has_value()) {
+       // H/W
+-      if (surface_manager_ != nullptr) {
++      if (d3d11_renderer_ != nullptr) {
+         width_ = width.value();
+       }
+       // S/W
+@@ -223,7 +226,7 @@ void VideoOutput::SetSize(std::optional<int64_t> width,
+     }
+     if (height.has_value()) {
+       // H/W
+-      if (surface_manager_ != nullptr) {
++      if (d3d11_renderer_ != nullptr) {
+         height_ = height.value();
+       }
+       // S/W
+@@ -246,9 +249,9 @@ void VideoOutput::CheckAndResize() {
+     return;
+   }
+   int64_t current_width = -1, current_height = -1;
+-  if (surface_manager_ != nullptr) {
+-    current_width = surface_manager_->width();
+-    current_height = surface_manager_->height();
++  if (d3d11_renderer_ != nullptr) {
++    current_width = d3d11_renderer_->width();
++    current_height = d3d11_renderer_->height();
+   }
+   if (pixel_buffer_ != nullptr) {
+     current_width = pixel_buffer_textures_.at(texture_id_)->width;
+@@ -295,29 +298,36 @@ void VideoOutput::Resize(int64_t required_width, int64_t required_height) {
+     texture_id_ = 0;
+   }
+   // H/W
+-  if (surface_manager_ != nullptr) {
+-    // Destroy internal ID3D11Texture2D & EGLSurface & create new with updated
+-    // dimensions while preserving previous EGLDisplay & EGLContext.
+-    surface_manager_->SetSize(static_cast<int32_t>(required_width),
+-                              static_cast<int32_t>(required_height));
++  if (d3d11_renderer_ != nullptr) {
++    // Resize the D3D11 texture.
++    d3d11_renderer_->SetSize(static_cast<int32_t>(required_width),
++                            static_cast<int32_t>(required_height));
++    
+     auto texture = std::make_unique<FlutterDesktopGpuSurfaceDescriptor>();
+     texture->struct_size = sizeof(FlutterDesktopGpuSurfaceDescriptor);
+-    texture->handle = surface_manager_->handle();
+-    texture->width = texture->visible_width = surface_manager_->width();
+-    texture->height = texture->visible_height = surface_manager_->height();
++    // Seed with the latest-completed-slot handle so Flutter has a valid
++    // surface even before the first mpv frame is committed.
++    texture->handle = d3d11_renderer_->ReadHandleSnapshot();
++    texture->width = texture->visible_width = d3d11_renderer_->width();
++    texture->height = texture->visible_height = d3d11_renderer_->height();
+     texture->release_context = nullptr;
+     texture->release_callback = [](void*) {};
+     texture->format = kFlutterDesktopPixelFormatBGRA8888;
++
+     auto texture_variant =
+         std::make_unique<flutter::TextureVariant>(flutter::GpuSurfaceTexture(
+             kFlutterDesktopGpuSurfaceTypeDxgiSharedHandle, [&](auto, auto) {
+               std::lock_guard<std::mutex> lock(textures_mutex_);
+               if (texture_id_) {
+-                surface_manager_->Read();
+-                return textures_.at(texture_id_).get();
+-              } else {
+-                return (FlutterDesktopGpuSurfaceDescriptor*)nullptr;
++                auto* desc = textures_.at(texture_id_).get();
++                // ConsumerAcquire() is lock-free.  texture_id_ != 0 implies
++                // d3d11_renderer_ is valid: UnregisterTexture guarantees that
++                // Flutter stops invoking this callback before the destructor
++                // resets d3d11_renderer_.
++                desc->handle = d3d11_renderer_->ConsumerAcquire();
++                return desc;
+               }
++              return (FlutterDesktopGpuSurfaceDescriptor*)nullptr;
+             }));
+     // Register new texture.
+     texture_id_ =
+diff --git a/media_kit_video/windows/video_output.h b/media_kit_video/windows/video_output.h
+index eebf30d..9f4be95 100644
+--- a/media_kit_video/windows/video_output.h
++++ b/media_kit_video/windows/video_output.h
+@@ -9,11 +9,13 @@
+ #ifndef VIDEO_OUTPUT_H_
+ #define VIDEO_OUTPUT_H_
+ 
++#include <atomic>
+ #include <optional>
+ 
+ #include <client.h>
+ #include <render.h>
+-#include <render_gl.h>
++
++#include "render_d3d11.h"
+ 
+ #include <future>
+ #include <memory>
+@@ -22,7 +24,7 @@
+ #include <flutter/plugin_registrar_windows.h>
+ #include <flutter/standard_method_codec.h>
+ 
+-#include "angle_surface_manager.h"
++#include "d3d11_renderer.h"
+ #include "thread_pool.h"
+ 
+ typedef struct _VideoOutputConfiguration {
+@@ -43,8 +45,8 @@ class VideoOutput {
+   int64_t texture_id() const { return texture_id_; }
+   int64_t width() const {
+     // H/W
+-    if (surface_manager_ != nullptr && texture_id_) {
+-      return surface_manager_->width();
++    if (d3d11_renderer_ != nullptr && texture_id_) {
++      return d3d11_renderer_->width();
+     }
+     // S/W
+     if (pixel_buffer_ != nullptr && texture_id_) {
+@@ -54,8 +56,8 @@ class VideoOutput {
+   }
+   int64_t height() const {
+     // H/W
+-    if (surface_manager_ != nullptr && texture_id_) {
+-      return surface_manager_->height();
++    if (d3d11_renderer_ != nullptr && texture_id_) {
++      return d3d11_renderer_->height();
+     }
+     // S/W
+     if (pixel_buffer_ != nullptr && texture_id_) {
+@@ -98,10 +100,8 @@ class VideoOutput {
+   int64_t texture_id_ = 0;
+   flutter::PluginRegistrarWindows* registrar_ = nullptr;
+   ThreadPool* thread_pool_ref_ = nullptr;
+-  // For preventing any asynchronous operations (primarily texture objects
+-  // deletion after unregister in |Resize|) access this object after
+-  // destruction.
+-  bool destroyed_ = false;
++  // Stop queued callbacks before draining and freeing their borrowed resources.
++  std::atomic<bool> destroyed_{false};
+ 
+   std::mutex textures_mutex_ = std::mutex();
+ 
+@@ -110,7 +110,7 @@ class VideoOutput {
+ 
+   // H/W rendering.
+ 
+-  std::unique_ptr<ANGLESurfaceManager> surface_manager_ = nullptr;
++  std::unique_ptr<D3D11Renderer> d3d11_renderer_ = nullptr;
+   std::unordered_map<int64_t,
+                      std::unique_ptr<FlutterDesktopGpuSurfaceDescriptor>>
+       textures_ = {};
