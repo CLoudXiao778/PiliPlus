@@ -48,6 +48,10 @@ final class PlayerDiagnostics {
     'video-bitrate',
     'audio-bitrate',
     'demuxer-cache-duration',
+    'pause',
+    'core-idle',
+    'seeking',
+    'eof-reached',
   ];
 
   NativePlayer? _player;
@@ -142,6 +146,9 @@ final class PlayerDiagnostics {
     for (final property in properties) {
       values[property] = _read(p, property);
     }
+    values['media-kit-playing'] = '${p.state.playing}';
+    values['media-kit-buffering'] = '${p.state.buffering}';
+    values['media-kit-completed'] = '${p.state.completed}';
     values['flutter-frames'] = '$_frameCount';
     values['flutter-build-ms'] = _average(_buildTotalMs, _frameCount);
     values['flutter-raster-ms'] = _average(_rasterTotalMs, _frameCount);
