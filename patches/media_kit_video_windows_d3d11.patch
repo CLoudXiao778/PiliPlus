@@ -52,10 +52,10 @@ index bd33504..fab2e49 100644
    message(NOTICE "media_kit: WARNING: package:media_kit_libs_*** not found.")
 diff --git a/media_kit_video/windows/d3d11_renderer.cc b/media_kit_video/windows/d3d11_renderer.cc
 new file mode 100644
-index 0000000..25d5245
+index 0000000..f6ea705
 --- /dev/null
 +++ b/media_kit_video/windows/d3d11_renderer.cc
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,163 @@
 +// This file is a part of media_kit
 +// (https://github.com/media-kit/media-kit).
 +//
@@ -105,6 +105,13 @@ index 0000000..25d5245
 +                << std::hex << hr << std::dec << ")" << std::endl;
 +    }
 +  }
++}
++
++bool D3D11Renderer::WaitForProducerSlot(int timeout_ms) {
++  if (mailbox_swap_chain_) {
++    return mailbox_swap_chain_->WaitForProducerSlot(timeout_ms);
++  }
++  return true;
 +}
 +
 +void D3D11Renderer::ProducerCommit() {
@@ -215,11 +222,11 @@ index 0000000..25d5245
 \ No newline at end of file
 diff --git a/media_kit_video/windows/d3d11_renderer.h b/media_kit_video/windows/d3d11_renderer.h
 new file mode 100644
-index 0000000..43faa8d
+index 0000000..3b3def2
 --- /dev/null
 +++ b/media_kit_video/windows/d3d11_renderer.h
-@@ -0,0 +1,99 @@
-+﻿// This file is a part of media_kit
+@@ -0,0 +1,104 @@
++// This file is a part of media_kit
 +// (https://github.com/media-kit/media-kit).
 +//
 +// Copyright © Predidit.
@@ -292,6 +299,11 @@ index 0000000..43faa8d
 +  // latest_completed_slot_, and finally publishes the new pending frame.
 +  void ProducerCommit();
 +
++  // Blocks (up to |timeout_ms|) until the slot that the next frame will be
++  // rendered into is free on the GPU.  See
++  // MailboxSwapChain::WaitForProducerSlot().  Producer thread only.
++  bool WaitForProducerSlot(int timeout_ms);
++
 +  // Called from the consumer thread (Flutter GpuSurfaceTexture callback).
 +  // Returns the DXGI shared HANDLE of the most recent fence-confirmed frame
 +  // via a single atomic load — no fence poll, no flush, no stall.
@@ -321,11 +333,11 @@ index 0000000..43faa8d
 \ No newline at end of file
 diff --git a/media_kit_video/windows/mailbox_swap_chain.cc b/media_kit_video/windows/mailbox_swap_chain.cc
 new file mode 100644
-index 0000000..7397e23
+index 0000000..55f220b
 --- /dev/null
 +++ b/media_kit_video/windows/mailbox_swap_chain.cc
-@@ -0,0 +1,214 @@
-+﻿// This file is a part of media_kit
+@@ -0,0 +1,229 @@
++// This file is a part of media_kit
 +// (https://github.com/media-kit/media-kit).
 +//
 +// Copyright © 2026 Predidit.
@@ -335,8 +347,10 @@ index 0000000..7397e23
 +
 +#include "mailbox_swap_chain.h"
 +
++#include <chrono>
 +#include <iostream>
 +#include <new>
++#include <thread>
 +
 +MailboxSwapChain::~MailboxSwapChain() {
 +  ReleaseSlots();
@@ -446,6 +460,19 @@ index 0000000..7397e23
 +  }
 +}
 +
++bool MailboxSwapChain::WaitForProducerSlot(int timeout_ms) {
++  auto& ws = slots_[write_slot_];
++  if (!ws.fence || ws.fence_value == 0) return true;
++  if (ws.fence->GetCompletedValue() >= ws.fence_value) return true;
++  const auto deadline = std::chrono::steady_clock::now() +
++                        std::chrono::milliseconds(timeout_ms);
++  while (ws.fence->GetCompletedValue() < ws.fence_value) {
++    if (std::chrono::steady_clock::now() >= deadline) return false;
++    std::this_thread::yield();
++  }
++  return true;
++}
++
 +HANDLE MailboxSwapChain::ConsumerAcquire() {
 +  // Always return the most recently fence-confirmed frame.
 +  // Advancement is handled exclusively by ProducerCommit (called one full
@@ -542,11 +569,11 @@ index 0000000..7397e23
 \ No newline at end of file
 diff --git a/media_kit_video/windows/mailbox_swap_chain.h b/media_kit_video/windows/mailbox_swap_chain.h
 new file mode 100644
-index 0000000..150ca96
+index 0000000..b86f066
 --- /dev/null
 +++ b/media_kit_video/windows/mailbox_swap_chain.h
-@@ -0,0 +1,125 @@
-+﻿// This file is a part of media_kit
+@@ -0,0 +1,133 @@
++// This file is a part of media_kit
 +// (https://github.com/media-kit/media-kit).
 +//
 +// Copyright © 2026 Predidit.
@@ -611,6 +638,14 @@ index 0000000..150ca96
 +  // latest_completed_slot_ (release store).  This is the sole site that
 +  // advances latest_completed_slot_; ConsumerAcquire never touches the fence.
 +  void ProducerCommit();
++
++  // Blocks (up to |timeout_ms|) until the slot that the next ProducerTexture()
++  // will overwrite is no longer in flight on the GPU.  The producer has no
++  // other backpressure: mpv_render_context_render() only submits work and
++  // returns, so a GPU slower than the producer lets the mailbox run ahead
++  // indefinitely and the displayed frame drifts behind the audio (the picture
++  // looks frozen until the queue drains).  Returns false on timeout.
++  bool WaitForProducerSlot(int timeout_ms);
 +
 +  // Called from the consumer thread (Flutter GpuSurfaceTexture callback).
 +  // Returns the DXGI shared HANDLE of the most recent fence-confirmed frame.
@@ -797,7 +832,7 @@ index 0000000..7fa4c12
 +
 +#endif
 diff --git a/media_kit_video/windows/video_output.cc b/media_kit_video/windows/video_output.cc
-index 1153ce0..3ab4ef1 100644
+index 1153ce0..b6c6a0c 100644
 --- a/media_kit_video/windows/video_output.cc
 +++ b/media_kit_video/windows/video_output.cc
 @@ -27,59 +27,71 @@ VideoOutput::VideoOutput(int64_t handle,
@@ -957,7 +992,7 @@ index 1153ce0..3ab4ef1 100644
  }
  
  void VideoOutput::NotifyRender() {
-@@ -158,20 +162,19 @@ void VideoOutput::NotifyRender() {
+@@ -158,20 +162,24 @@ void VideoOutput::NotifyRender() {
  void VideoOutput::Render() {
    if (texture_id_) {
      // H/W
@@ -976,6 +1011,11 @@ index 1153ce0..3ab4ef1 100644
 -        mpv_render_context_render(render_context_, params);
 -      });
 +    if (d3d11_renderer_ != nullptr) {
++      // Bound the producer to the GPU.  mpv treats a frame as displayed as
++      // soon as mpv_render_context_render() returns, so without this wait the
++      // mailbox can run ahead of the GPU indefinitely and the visible frame
++      // drifts seconds behind the audio (picture frozen, audio continues).
++      d3d11_renderer_->WaitForProducerSlot(30);
 +      // mpv renders into the mailbox slot owned by the producer and flushes
 +      // its work to the immediate context before returning.
 +      mpv_d3d11_fbo fbo = {d3d11_renderer_->render_target()};
@@ -991,7 +1031,7 @@ index 1153ce0..3ab4ef1 100644
      }
      // S/W
      if (pixel_buffer_ != nullptr) {
-@@ -209,7 +212,7 @@ void VideoOutput::SetSize(std::optional<int64_t> width,
+@@ -209,7 +217,7 @@ void VideoOutput::SetSize(std::optional<int64_t> width,
    thread_pool_ref_->Post([&, width, height]() {
      if (width.has_value()) {
        // H/W
@@ -1000,7 +1040,7 @@ index 1153ce0..3ab4ef1 100644
          width_ = width.value();
        }
        // S/W
-@@ -223,7 +226,7 @@ void VideoOutput::SetSize(std::optional<int64_t> width,
+@@ -223,7 +231,7 @@ void VideoOutput::SetSize(std::optional<int64_t> width,
      }
      if (height.has_value()) {
        // H/W
@@ -1009,7 +1049,7 @@ index 1153ce0..3ab4ef1 100644
          height_ = height.value();
        }
        // S/W
-@@ -246,9 +249,9 @@ void VideoOutput::CheckAndResize() {
+@@ -246,9 +254,9 @@ void VideoOutput::CheckAndResize() {
      return;
    }
    int64_t current_width = -1, current_height = -1;
@@ -1022,7 +1062,7 @@ index 1153ce0..3ab4ef1 100644
    }
    if (pixel_buffer_ != nullptr) {
      current_width = pixel_buffer_textures_.at(texture_id_)->width;
-@@ -295,29 +298,36 @@ void VideoOutput::Resize(int64_t required_width, int64_t required_height) {
+@@ -295,29 +303,36 @@ void VideoOutput::Resize(int64_t required_width, int64_t required_height) {
      texture_id_ = 0;
    }
    // H/W
