@@ -49,11 +49,7 @@ jobs:
         run: |
           git clone --depth=1 -b native https://github.com/bggRGjQaUbCoE/media-kit.git media-kit
           git -C media-kit apply "$env:GITHUB_WORKSPACE/patches/media_kit_video_windows_render.patch"
-          @"
-          dependency_overrides:
-            media_kit_video:
-              path: media-kit/media_kit_video
-          "@ | Set-Content -Path pubspec_overrides.yaml -Encoding UTF8
+          python -c "import re; p='pubspec.yaml'; s=open(p,encoding='utf-8').read(); s=re.sub(r'(?ms)^  media_kit_video:\n(?:    .*\n)+', '  media_kit_video:\n    path: media-kit/media_kit_video\n', s); open(p,'w',encoding='utf-8').write(s)"
           flutter pub get
 
       - name: Build Windows
