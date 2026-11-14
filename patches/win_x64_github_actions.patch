@@ -1,0 +1,37 @@
+diff --git a/.github/workflows/win_x64.yml b/.github/workflows/win_x64.yml
+index 563f1ca05..c00575883 100644
+--- a/.github/workflows/win_x64.yml
++++ b/.github/workflows/win_x64.yml
+@@ -44,6 +44,18 @@ jobs:
+         shell: pwsh
+         run: lib/scripts/patch.ps1 windows
+ 
++      - name: Patch media_kit_video render timing
++        shell: pwsh
++        run: |
++          git clone --depth=1 -b native https://github.com/bggRGjQaUbCoE/media-kit.git media-kit
++          git -C media-kit apply "$env:GITHUB_WORKSPACE/patches/media_kit_video_windows_render.patch"
++          @"
++          dependency_overrides:
++            media_kit_video:
++              path: media-kit/media_kit_video
++          "@ | Set-Content -Path pubspec_overrides.yaml -Encoding UTF8
++          flutter pub get
++
+       - name: Build Windows
+         run: |
+           fastforge package --platform windows --targets exe --flutter-build-args="dart-define-from-file=pili_release.json,no-pub" --skip-clean
+@@ -55,6 +67,13 @@ jobs:
+           mv build/windows/x64/runner/Release/* Release/PiliPlus-Win/
+           mv dist/**/*.exe PiliPlus-Win-Setup/PiliPlus_windows_${{env.version}}_x64_setup.exe
+ 
++      - name: Use updated libmpv (d3d11egl / d3d11 render API)
++        shell: pwsh
++        run: |
++          Invoke-WebRequest -Uri "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261111/mpv-dev-x86_64-20261111-git-bcde6b93cc.7z" -OutFile libmpv.7z
++          7z x libmpv.7z -olibmpv -y
++          Copy-Item libmpv/libmpv-2.dll Release/PiliPlus-Win/libmpv-2.dll -Force
++
+       - name: Compress
+         run: |
+           Compress-Archive -Path "Release/PiliPlus-Win" -DestinationPath "PiliPlus_windows_${{env.version}}_x64_portable.zip"

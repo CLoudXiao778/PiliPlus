@@ -967,6 +967,16 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       play: false,
     );
     if (seekTo != null && seekTo > Duration.zero) {
+      // The seek must not be sent before the EDL timeline has been opened:
+      // mpv applies it to an empty playlist, playback starts from 0 and the
+      // resume position is lost.  Stay paused until the file reports its
+      // duration, seek, then let _initializePlayer() start playback.
+      await player.pause();
+      final deadline = DateTime.now().add(const Duration(seconds: 8));
+      while (player.state.duration <= Duration.zero &&
+          DateTime.now().isBefore(deadline)) {
+        await Future.delayed(const Duration(milliseconds: 50));
+      }
       await player.seek(seekTo);
     }
   }
@@ -981,10 +991,16 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           ? ctr.current.last
           : ctr.current.last.copyWith(start: Duration.zero);
       return () async {
-        await ctr.open(media, play: true);
+        await ctr.open(media, play: false);
         if (!isLive && position > Duration.zero) {
+          final deadline = DateTime.now().add(const Duration(seconds: 8));
+          while (ctr.state.duration <= Duration.zero &&
+              DateTime.now().isBefore(deadline)) {
+            await Future.delayed(const Duration(milliseconds: 50));
+          }
           await ctr.seek(position);
         }
+        await ctr.play();
       }();
     }
     return null;

@@ -46,5 +46,9 @@ enum HwDecType {
       ? kDebugMode
             ? autoSafe.hwdec
             : [mediacodec.hwdec, autoSafe.hwdec].join(',')
-      : auto.hwdec;
+      // Copy-back decoders avoid sharing the D3D11 device/immediate context
+      // between the decoder thread and the native D3D11 video renderer on
+      // Windows; zero-copy d3d11va stalls the picture for seconds on some
+      // Intel drivers.
+      : autoCopy.hwdec;
 }
