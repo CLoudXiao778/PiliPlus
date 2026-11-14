@@ -23,6 +23,9 @@ final class PlayerDiagnostics {
 
   static const bool enabled = bool.fromEnvironment('PLAYER_DIAGNOSTICS');
 
+  /// Marks builds which use the native D3D11 render backend.
+  static const bool d3d11 = bool.fromEnvironment('MEDIA_KIT_D3D11');
+
   /// Properties sampled once per second and shown in the playback info dialog.
   static const List<String> properties = [
     'time-pos',
@@ -156,7 +159,8 @@ final class PlayerDiagnostics {
         '(${BuildConfig.versionCode}, ${BuildConfig.commitHash})',
       )
       ..writeln('time=${DateTime.now().toIso8601String()}')
-      ..writeln('platform=${Platform.operatingSystemVersion}');
+      ..writeln('platform=${Platform.operatingSystemVersion}')
+      ..writeln('render-backend=${d3d11 ? 'd3d11' : 'opengl-angle'}');
     final values = snapshot(player);
     for (final entry in values.entries) {
       buffer.writeln('${entry.key}=${entry.value}');
@@ -238,6 +242,7 @@ final class PlayerDiagnostics {
       ..writeln('commit=${BuildConfig.commitHash}')
       ..writeln('build-time=${BuildConfig.buildTime}')
       ..writeln('platform=${Platform.operatingSystemVersion}')
+      ..writeln('render-backend=${d3d11 ? 'd3d11' : 'opengl-angle'}')
       ..writeln('sample-log=$sampleLogPath')
       ..writeln('mpv-log=$mpvLogPath')
       ..writeln('# one line per second, key=value');

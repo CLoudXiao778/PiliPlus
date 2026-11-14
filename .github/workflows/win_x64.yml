@@ -44,11 +44,13 @@ jobs:
         shell: pwsh
         run: lib/scripts/patch.ps1 windows
 
-      - name: Patch media_kit_video render timing
+      - name: Patch media_kit_video D3D11 renderer
         shell: pwsh
         run: |
           git clone --depth=1 -b native https://github.com/bggRGjQaUbCoE/media-kit.git media-kit
-          git -C media-kit apply "$env:GITHUB_WORKSPACE/patches/media_kit_video_windows_render.patch"
+          git -C media-kit fetch --depth=1 origin 85f0a69ea66b100882b27a3375c72e5155375343
+          git -C media-kit checkout --detach 85f0a69ea66b100882b27a3375c72e5155375343
+          git -C media-kit apply "$env:GITHUB_WORKSPACE/patches/media_kit_video_windows_d3d11.patch"
           @'
           import re
           p = 'pubspec.yaml'
@@ -70,10 +72,21 @@ jobs:
           7z x libmpv.7z -olibmpv -y
           New-Item -ItemType Directory -Force C:\libmpv | Out-Null
           Copy-Item libmpv/libmpv-2.dll C:\libmpv\libmpv-2.dll -Force
+          # Pre-extract the same libmpv into the CMake build directory so the
+          # D3D11 video backend compiles against the matching render.h and links
+          # the matching import library. media_kit_libs_windows_video will see a
+          # non-empty libmpv directory and skip its own extraction.
+          $libmpvSrc = "build/windows/x64/libmpv"
+          New-Item -ItemType Directory -Force $libmpvSrc | Out-Null
+          7z x libmpv.7z "-o$libmpvSrc" -y
+          if (Test-Path "$libmpvSrc/include/mpv") {
+            Move-Item "$libmpvSrc/include/mpv/*" "$libmpvSrc/include/" -Force
+            Remove-Item "$libmpvSrc/include/mpv" -Recurse -Force
+          }
 
       - name: Build Windows
         run: |
-          fastforge package --platform windows --targets exe --flutter-build-args="dart-define-from-file=pili_release.json,dart-define=PLAYER_DIAGNOSTICS=true,no-pub" --skip-clean
+          fastforge package --platform windows --targets exe --flutter-build-args="dart-define-from-file=pili_release.json,dart-define=PLAYER_DIAGNOSTICS=true,dart-define=MEDIA_KIT_D3D11=true,no-pub" --skip-clean
 
       - name: Verify bundled assets
         shell: pwsh
