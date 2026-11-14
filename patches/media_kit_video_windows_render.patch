@@ -1,0 +1,96 @@
+diff --git a/media_kit_video/windows/video_output.cc b/media_kit_video/windows/video_output.cc
+index 1153ce0..b772e2e 100644
+--- a/media_kit_video/windows/video_output.cc
++++ b/media_kit_video/windows/video_output.cc
+@@ -166,12 +166,22 @@ void VideoOutput::Render() {
+             surface_manager_->height(),
+             0,
+         };
++        // Let Flutter own the presentation cadence. mpv's render API otherwise
++        // blocks until the frame's target display time, but media_kit never
++        // calls mpv_render_context_report_swap(), so this wait only stalls the
++        // render thread (and the texture mutex) and makes the frame miss
++        // Flutter's raster deadline. This is especially visible with 24/30 fps
++        // video on 60 Hz displays, and with the `video-timing-offset=0` set
++        // below, where there is no headroom at all.
++        int block_for_target_time = 0;
+         mpv_render_param params[]{
+             {MPV_RENDER_PARAM_OPENGL_FBO, &fbo},
++            {MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, &block_for_target_time},
+             {MPV_RENDER_PARAM_INVALID, nullptr},
+         };
+         mpv_render_context_render(render_context_, params);
+       });
++      frame_ready_.store(true);
+     }
+     // S/W
+     if (pixel_buffer_ != nullptr) {
+@@ -180,14 +190,17 @@ void VideoOutput::Render() {
+           static_cast<int32_t>(pixel_buffer_textures_.at(texture_id_)->height),
+       };
+       auto pitch = 4 * size[0];
++      int block_for_target_time = 0;
+       mpv_render_param params[]{
+           {MPV_RENDER_PARAM_SW_SIZE, size},
+           {MPV_RENDER_PARAM_SW_FORMAT, "rgb0"},
+           {MPV_RENDER_PARAM_SW_STRIDE, &pitch},
+           {MPV_RENDER_PARAM_SW_POINTER, pixel_buffer_.get()},
++          {MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, &block_for_target_time},
+           {MPV_RENDER_PARAM_INVALID, nullptr},
+       };
+       mpv_render_context_render(render_context_, params);
++      frame_ready_.store(true);
+     }
+     try {
+       // Notify Flutter that a new frame is available.
+@@ -300,6 +313,9 @@ void VideoOutput::Resize(int64_t required_width, int64_t required_height) {
+     // dimensions while preserving previous EGLDisplay & EGLContext.
+     surface_manager_->SetSize(static_cast<int32_t>(required_width),
+                               static_cast<int32_t>(required_height));
++    // The surface is new & empty; do not copy it until the first frame has
++    // actually been rendered into it.
++    frame_ready_.store(false);
+     auto texture = std::make_unique<FlutterDesktopGpuSurfaceDescriptor>();
+     texture->struct_size = sizeof(FlutterDesktopGpuSurfaceDescriptor);
+     texture->handle = surface_manager_->handle();
+@@ -313,7 +329,14 @@ void VideoOutput::Resize(int64_t required_width, int64_t required_height) {
+             kFlutterDesktopGpuSurfaceTypeDxgiSharedHandle, [&](auto, auto) {
+               std::lock_guard<std::mutex> lock(textures_mutex_);
+               if (texture_id_) {
+-                surface_manager_->Read();
++                // Only copy the internal ANGLE surface to the shared texture
++                // when a new video frame was actually rendered. Flutter calls
++                // this callback on every paint, which is commonly 60 Hz even
++                // for 30 fps video (and while paused), so an unconditional
++                // CopyResource wastes a full 1920x1080 GPU copy each time.
++                if (frame_ready_.exchange(false)) {
++                  surface_manager_->Read();
++                }
+                 return textures_.at(texture_id_).get();
+               } else {
+                 return (FlutterDesktopGpuSurfaceDescriptor*)nullptr;
+diff --git a/media_kit_video/windows/video_output.h b/media_kit_video/windows/video_output.h
+index eebf30d..796664c 100644
+--- a/media_kit_video/windows/video_output.h
++++ b/media_kit_video/windows/video_output.h
+@@ -9,6 +9,7 @@
+ #ifndef VIDEO_OUTPUT_H_
+ #define VIDEO_OUTPUT_H_
+ 
++#include <atomic>
+ #include <optional>
+ 
+ #include <client.h>
+@@ -103,6 +104,12 @@ class VideoOutput {
+   // destruction.
+   bool destroyed_ = false;
+ 
++  // Set after a new video frame has been rendered into the internal texture.
++  // Flutter may sample the same texture multiple times per displayed video
++  // frame (e.g. 60 Hz UI with 30 fps video, or while paused); avoid copying
++  // the full 1080p surface again unless the contents actually changed.
++  std::atomic<bool> frame_ready_{false};
++
+   std::mutex textures_mutex_ = std::mutex();
+ 
+   std::unordered_map<int64_t, std::unique_ptr<flutter::TextureVariant>>
